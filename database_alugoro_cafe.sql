@@ -1,8 +1,3 @@
--- Database untuk Alugoro Cafe Management System
--- Buat database
-CREATE DATABASE IF NOT EXISTS alugoro_cafe;
-USE alugoro_cafe;
-
 -- Tabel 1: users (untuk login)
 CREATE TABLE users (
     id INT PRIMARY KEY AUTO_INCREMENT,
