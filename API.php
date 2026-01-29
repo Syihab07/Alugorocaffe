@@ -1,1259 +1,875 @@
 <?php
-/**
- * Alugoro Cafe Management System - REST API
- * 
- * Professional API endpoint untuk manajemen restoran/cafe
- * Features: CRUD operations, Authentication, Cart Management, Reporting, Activity Logging
- * 
- * @author Alugoro Cafe Development Team
- * @version 1.0.0
- * @license MIT
- */
+header("Content-Type: application/json");
+header("Access-Control-Allow-Origin: *");
+header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
+header("Access-Control-Allow-Headers: Content-Type");
 
-// Error reporting untuk development (nonaktifkan di production)
-error_reporting(E_ALL);
-ini_set('display_errors', 1);
-
-// Headers untuk CORS dan JSON response
-header('Content-Type: application/json; charset=UTF-8');
-header('Access-Control-Allow-Origin: *');
-header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
-header('Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With');
-
-// Handle preflight OPTIONS request
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+// Handle preflight requests
+if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') {
     http_response_code(200);
     exit();
 }
 
-// Session start
-session_start();
+include "config.php";
 
-// Database Configuration
-class Database {
-    private $host = "localhost";
-    private $db_name = "alugoro_cafe";
-    private $username = "root";
-    private $password = "";
-    private $conn;
-    
-    public function getConnection() {
-        $this->conn = null;
-        
-        try {
-            $this->conn = new PDO(
-                "mysql:host=" . $this->host . ";dbname=" . $this->db_name,
-                $this->username,
-                $this->password,
-                array(PDO::MYSQL_ATTR_INIT_COMMAND => "SET NAMES utf8")
-            );
-            $this->conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-            $this->conn->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
-        } catch(PDOException $e) {
-            error_log("Connection Error: " . $e->getMessage());
-        }
-        
-        return $this->conn;
-    }
-}
-
-// Response Helper Class
-class ApiResponse {
-    public static function success($data = null, $message = "Success", $code = 200) {
-        http_response_code($code);
-        echo json_encode([
-            'status' => 'success',
-            'message' => $message,
-            'data' => $data,
-            'timestamp' => date('Y-m-d H:i:s')
-        ], JSON_PRETTY_PRINT);
-        exit();
-    }
-    
-    public static function error($message = "Error occurred", $code = 400, $errors = null) {
-        http_response_code($code);
-        echo json_encode([
-            'status' => 'error',
-            'message' => $message,
-            'errors' => $errors,
-            'timestamp' => date('Y-m-d H:i:s')
-        ], JSON_PRETTY_PRINT);
-        exit();
-    }
-    
-    public static function unauthorized($message = "Unauthorized access") {
-        self::error($message, 401);
-    }
-    
-    public static function forbidden($message = "Forbidden") {
-        self::error($message, 403);
-    }
-    
-    public static function notFound($message = "Resource not found") {
-        self::error($message, 404);
-    }
-}
-
-// Activity Logger Class
-class ActivityLogger {
-    private $db;
-    
-    public function __construct($db) {
-        $this->db = $db;
-    }
-    
-    public function log($userId, $action, $description, $ipAddress = null) {
-        try {
-            $query = "INSERT INTO activity_logs (user_id, action, description, ip_address, created_at) 
-                      VALUES (:user_id, :action, :description, :ip_address, NOW())";
-            
-            $stmt = $this->db->prepare($query);
-            $stmt->bindParam(':user_id', $userId);
-            $stmt->bindParam(':action', $action);
-            $stmt->bindParam(':description', $description);
-            $stmt->bindParam(':ip_address', $ipAddress);
-            
-            return $stmt->execute();
-        } catch(PDOException $e) {
-            error_log("Activity Log Error: " . $e->getMessage());
-            return false;
-        }
-    }
-}
-
-// Authentication Class
-class Auth {
-    private $db;
-    private $logger;
-    
-    public function __construct($db, $logger) {
-        $this->db = $db;
-        $this->logger = $logger;
-    }
-    
-    public function register($data) {
-        // Validasi input
-        $required = ['username', 'email', 'password', 'full_name'];
-        foreach ($required as $field) {
-            if (empty($data[$field])) {
-                ApiResponse::error("Field '$field' is required", 400);
-            }
-        }
-        
-        // Validasi email
-        if (!filter_var($data['email'], FILTER_VALIDATE_EMAIL)) {
-            ApiResponse::error("Invalid email format", 400);
-        }
-        
-        // Validasi password strength
-        if (strlen($data['password']) < 6) {
-            ApiResponse::error("Password must be at least 6 characters", 400);
-        }
-        
-        // Check existing user
-        $query = "SELECT id FROM users WHERE username = :username OR email = :email";
-        $stmt = $this->db->prepare($query);
-        $stmt->bindParam(':username', $data['username']);
-        $stmt->bindParam(':email', $data['email']);
-        $stmt->execute();
-        
-        if ($stmt->rowCount() > 0) {
-            ApiResponse::error("Username or email already exists", 409);
-        }
-        
-        // Insert new user
-        $query = "INSERT INTO users (username, email, password, full_name, role, created_at) 
-                  VALUES (:username, :email, :password, :full_name, :role, NOW())";
-        
-        $stmt = $this->db->prepare($query);
-        $hashedPassword = password_hash($data['password'], PASSWORD_BCRYPT);
-        $role = isset($data['role']) ? $data['role'] : 'cashier';
-        
-        $stmt->bindParam(':username', $data['username']);
-        $stmt->bindParam(':email', $data['email']);
-        $stmt->bindParam(':password', $hashedPassword);
-        $stmt->bindParam(':full_name', $data['full_name']);
-        $stmt->bindParam(':role', $role);
-        
-        if ($stmt->execute()) {
-            $userId = $this->db->lastInsertId();
-            $this->logger->log($userId, 'REGISTER', "New user registered: {$data['username']}", $_SERVER['REMOTE_ADDR']);
-            
-            ApiResponse::success([
-                'user_id' => $userId,
-                'username' => $data['username']
-            ], "Registration successful", 201);
-        } else {
-            ApiResponse::error("Registration failed", 500);
-        }
-    }
-    
-    public function login($data) {
-        // Validasi input
-        if (empty($data['username']) || empty($data['password'])) {
-            ApiResponse::error("Username and password are required", 400);
-        }
-        
-        // Get user
-        $query = "SELECT * FROM users WHERE username = :username AND status = 'active'";
-        $stmt = $this->db->prepare($query);
-        $stmt->bindParam(':username', $data['username']);
-        $stmt->execute();
-        
-        $user = $stmt->fetch();
-        
-        if (!$user || !password_verify($data['password'], $user['password'])) {
-            ApiResponse::error("Invalid username or password", 401);
-        }
-        
-        // Update last login
-        $updateQuery = "UPDATE users SET last_login = NOW() WHERE id = :id";
-        $updateStmt = $this->db->prepare($updateQuery);
-        $updateStmt->bindParam(':id', $user['id']);
-        $updateStmt->execute();
-        
-        // Set session
-        $_SESSION['user_id'] = $user['id'];
-        $_SESSION['username'] = $user['username'];
-        $_SESSION['role'] = $user['role'];
-        $_SESSION['full_name'] = $user['full_name'];
-        
-        // Set remember me cookie if requested
-        if (isset($data['remember_me']) && $data['remember_me']) {
-            $token = bin2hex(random_bytes(32));
-            $hashedToken = password_hash($token, PASSWORD_BCRYPT);
-            
-            // Save token to database
-            $tokenQuery = "INSERT INTO remember_tokens (user_id, token, expires_at) 
-                          VALUES (:user_id, :token, DATE_ADD(NOW(), INTERVAL 30 DAY))";
-            $tokenStmt = $this->db->prepare($tokenQuery);
-            $tokenStmt->bindParam(':user_id', $user['id']);
-            $tokenStmt->bindParam(':token', $hashedToken);
-            $tokenStmt->execute();
-            
-            setcookie('remember_token', $token, time() + (30 * 24 * 60 * 60), '/');
-        }
-        
-        $this->logger->log($user['id'], 'LOGIN', "User logged in", $_SERVER['REMOTE_ADDR']);
-        
-        ApiResponse::success([
-            'user' => [
-                'id' => $user['id'],
-                'username' => $user['username'],
-                'email' => $user['email'],
-                'full_name' => $user['full_name'],
-                'role' => $user['role']
-            ],
-            'session_id' => session_id()
-        ], "Login successful");
-    }
-    
-    public function logout() {
-        if (isset($_SESSION['user_id'])) {
-            $this->logger->log($_SESSION['user_id'], 'LOGOUT', "User logged out", $_SERVER['REMOTE_ADDR']);
-        }
-        
-        // Clear remember token
-        if (isset($_COOKIE['remember_token'])) {
-            setcookie('remember_token', '', time() - 3600, '/');
-        }
-        
-        session_destroy();
-        ApiResponse::success(null, "Logout successful");
-    }
-    
-    public function checkAuth() {
-        if (!isset($_SESSION['user_id'])) {
-            ApiResponse::unauthorized("Please login first");
-        }
-        return $_SESSION['user_id'];
-    }
-    
-    public function checkRole($allowedRoles) {
-        $this->checkAuth();
-        
-        if (!in_array($_SESSION['role'], $allowedRoles)) {
-            ApiResponse::forbidden("You don't have permission to access this resource");
-        }
-    }
-}
-
-// Menu Management Class
-class MenuAPI {
-    private $db;
-    private $logger;
-    
-    public function __construct($db, $logger) {
-        $this->db = $db;
-        $this->logger = $logger;
-    }
-    
-    public function getAll($filters = []) {
-        $query = "SELECT m.*, c.name as category_name 
-                  FROM menu_items m 
-                  LEFT JOIN categories c ON m.category_id = c.id 
-                  WHERE 1=1";
-        
-        $params = [];
-        
-        if (!empty($filters['category_id'])) {
-            $query .= " AND m.category_id = :category_id";
-            $params[':category_id'] = $filters['category_id'];
-        }
-        
-        if (!empty($filters['status'])) {
-            $query .= " AND m.status = :status";
-            $params[':status'] = $filters['status'];
-        }
-        
-        if (!empty($filters['search'])) {
-            $query .= " AND (m.name LIKE :search OR m.description LIKE :search)";
-            $params[':search'] = '%' . $filters['search'] . '%';
-        }
-        
-        $query .= " ORDER BY m.name ASC";
-        
-        $stmt = $this->db->prepare($query);
-        $stmt->execute($params);
-        
-        $items = $stmt->fetchAll();
-        
-        ApiResponse::success([
-            'items' => $items,
-            'total' => count($items)
-        ]);
-    }
-    
-    public function getById($id) {
-        $query = "SELECT m.*, c.name as category_name 
-                  FROM menu_items m 
-                  LEFT JOIN categories c ON m.category_id = c.id 
-                  WHERE m.id = :id";
-        
-        $stmt = $this->db->prepare($query);
-        $stmt->bindParam(':id', $id);
-        $stmt->execute();
-        
-        $item = $stmt->fetch();
-        
-        if (!$item) {
-            ApiResponse::notFound("Menu item not found");
-        }
-        
-        ApiResponse::success($item);
-    }
-    
-    public function create($data) {
-        $required = ['name', 'category_id', 'price'];
-        foreach ($required as $field) {
-            if (empty($data[$field])) {
-                ApiResponse::error("Field '$field' is required", 400);
-            }
-        }
-        
-        // Handle image upload
-        $imagePath = null;
-        if (isset($_FILES['image']) && $_FILES['image']['error'] === UPLOAD_ERR_OK) {
-            $imagePath = $this->handleImageUpload($_FILES['image']);
-        }
-        
-        $query = "INSERT INTO menu_items (name, description, category_id, price, image, stock, status, created_at) 
-                  VALUES (:name, :description, :category_id, :price, :image, :stock, :status, NOW())";
-        
-        $stmt = $this->db->prepare($query);
-        
-        $status = isset($data['status']) ? $data['status'] : 'available';
-        $stock = isset($data['stock']) ? $data['stock'] : 0;
-        
-        $stmt->bindParam(':name', $data['name']);
-        $stmt->bindParam(':description', $data['description']);
-        $stmt->bindParam(':category_id', $data['category_id']);
-        $stmt->bindParam(':price', $data['price']);
-        $stmt->bindParam(':image', $imagePath);
-        $stmt->bindParam(':stock', $stock);
-        $stmt->bindParam(':status', $status);
-        
-        if ($stmt->execute()) {
-            $itemId = $this->db->lastInsertId();
-            $this->logger->log($_SESSION['user_id'], 'CREATE_MENU', "Created menu item: {$data['name']}", $_SERVER['REMOTE_ADDR']);
-            
-            ApiResponse::success([
-                'id' => $itemId,
-                'name' => $data['name']
-            ], "Menu item created successfully", 201);
-        } else {
-            ApiResponse::error("Failed to create menu item", 500);
-        }
-    }
-    
-    public function update($id, $data) {
-        // Check if item exists
-        $checkQuery = "SELECT * FROM menu_items WHERE id = :id";
-        $checkStmt = $this->db->prepare($checkQuery);
-        $checkStmt->bindParam(':id', $id);
-        $checkStmt->execute();
-        
-        if ($checkStmt->rowCount() === 0) {
-            ApiResponse::notFound("Menu item not found");
-        }
-        
-        $item = $checkStmt->fetch();
-        
-        // Handle image upload
-        $imagePath = $item['image'];
-        if (isset($_FILES['image']) && $_FILES['image']['error'] === UPLOAD_ERR_OK) {
-            $imagePath = $this->handleImageUpload($_FILES['image']);
-            
-            // Delete old image
-            if ($item['image'] && file_exists($item['image'])) {
-                unlink($item['image']);
-            }
-        }
-        
-        $query = "UPDATE menu_items SET 
-                  name = :name,
-                  description = :description,
-                  category_id = :category_id,
-                  price = :price,
-                  image = :image,
-                  stock = :stock,
-                  status = :status,
-                  updated_at = NOW()
-                  WHERE id = :id";
-        
-        $stmt = $this->db->prepare($query);
-        
-        $name = isset($data['name']) ? $data['name'] : $item['name'];
-        $description = isset($data['description']) ? $data['description'] : $item['description'];
-        $categoryId = isset($data['category_id']) ? $data['category_id'] : $item['category_id'];
-        $price = isset($data['price']) ? $data['price'] : $item['price'];
-        $stock = isset($data['stock']) ? $data['stock'] : $item['stock'];
-        $status = isset($data['status']) ? $data['status'] : $item['status'];
-        
-        $stmt->bindParam(':name', $name);
-        $stmt->bindParam(':description', $description);
-        $stmt->bindParam(':category_id', $categoryId);
-        $stmt->bindParam(':price', $price);
-        $stmt->bindParam(':image', $imagePath);
-        $stmt->bindParam(':stock', $stock);
-        $stmt->bindParam(':status', $status);
-        $stmt->bindParam(':id', $id);
-        
-        if ($stmt->execute()) {
-            $this->logger->log($_SESSION['user_id'], 'UPDATE_MENU', "Updated menu item ID: $id", $_SERVER['REMOTE_ADDR']);
-            ApiResponse::success(null, "Menu item updated successfully");
-        } else {
-            ApiResponse::error("Failed to update menu item", 500);
-        }
-    }
-    
-    public function delete($id) {
-        // Check if item exists
-        $checkQuery = "SELECT * FROM menu_items WHERE id = :id";
-        $checkStmt = $this->db->prepare($checkQuery);
-        $checkStmt->bindParam(':id', $id);
-        $checkStmt->execute();
-        
-        if ($checkStmt->rowCount() === 0) {
-            ApiResponse::notFound("Menu item not found");
-        }
-        
-        $item = $checkStmt->fetch();
-        
-        // Delete image file
-        if ($item['image'] && file_exists($item['image'])) {
-            unlink($item['image']);
-        }
-        
-        // Delete from database
-        $query = "DELETE FROM menu_items WHERE id = :id";
-        $stmt = $this->db->prepare($query);
-        $stmt->bindParam(':id', $id);
-        
-        if ($stmt->execute()) {
-            $this->logger->log($_SESSION['user_id'], 'DELETE_MENU', "Deleted menu item ID: $id", $_SERVER['REMOTE_ADDR']);
-            ApiResponse::success(null, "Menu item deleted successfully");
-        } else {
-            ApiResponse::error("Failed to delete menu item", 500);
-        }
-    }
-    
-    private function handleImageUpload($file) {
-        $allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
-        $maxSize = 5 * 1024 * 1024; // 5MB
-        
-        if (!in_array($file['type'], $allowedTypes)) {
-            ApiResponse::error("Invalid file type. Only JPG, PNG, GIF, and WEBP allowed", 400);
-        }
-        
-        if ($file['size'] > $maxSize) {
-            ApiResponse::error("File size exceeds 5MB limit", 400);
-        }
-        
-        $uploadDir = 'uploads/menu/';
-        if (!is_dir($uploadDir)) {
-            mkdir($uploadDir, 0755, true);
-        }
-        
-        $extension = pathinfo($file['name'], PATHINFO_EXTENSION);
-        $filename = uniqid() . '_' . time() . '.' . $extension;
-        $uploadPath = $uploadDir . $filename;
-        
-        if (move_uploaded_file($file['tmp_name'], $uploadPath)) {
-            return $uploadPath;
-        } else {
-            ApiResponse::error("Failed to upload image", 500);
-        }
-    }
-}
-
-// Cart Management Class
-class CartAPI {
-    private $db;
-    private $logger;
-    
-    public function __construct($db, $logger) {
-        $this->db = $db;
-        $this->logger = $logger;
-    }
-    
-    public function getCart($userId) {
-        $query = "SELECT c.*, m.name, m.price, m.image, m.status,
-                  (c.quantity * m.price) as subtotal
-                  FROM cart c
-                  JOIN menu_items m ON c.menu_item_id = m.id
-                  WHERE c.user_id = :user_id
-                  ORDER BY c.created_at DESC";
-        
-        $stmt = $this->db->prepare($query);
-        $stmt->bindParam(':user_id', $userId);
-        $stmt->execute();
-        
-        $items = $stmt->fetchAll();
-        
-        $total = 0;
-        foreach ($items as $item) {
-            $total += $item['subtotal'];
-        }
-        
-        ApiResponse::success([
-            'items' => $items,
-            'total_items' => count($items),
-            'total_amount' => $total
-        ]);
-    }
-    
-    public function addToCart($userId, $data) {
-        if (empty($data['menu_item_id']) || empty($data['quantity'])) {
-            ApiResponse::error("Menu item ID and quantity are required", 400);
-        }
-        
-        // Check if menu item exists and available
-        $menuQuery = "SELECT * FROM menu_items WHERE id = :id AND status = 'available'";
-        $menuStmt = $this->db->prepare($menuQuery);
-        $menuStmt->bindParam(':id', $data['menu_item_id']);
-        $menuStmt->execute();
-        
-        if ($menuStmt->rowCount() === 0) {
-            ApiResponse::error("Menu item not available", 404);
-        }
-        
-        $menuItem = $menuStmt->fetch();
-        
-        // Check stock
-        if ($menuItem['stock'] < $data['quantity']) {
-            ApiResponse::error("Insufficient stock. Available: " . $menuItem['stock'], 400);
-        }
-        
-        // Check if item already in cart
-        $checkQuery = "SELECT * FROM cart WHERE user_id = :user_id AND menu_item_id = :menu_item_id";
-        $checkStmt = $this->db->prepare($checkQuery);
-        $checkStmt->bindParam(':user_id', $userId);
-        $checkStmt->bindParam(':menu_item_id', $data['menu_item_id']);
-        $checkStmt->execute();
-        
-        if ($checkStmt->rowCount() > 0) {
-            // Update quantity
-            $cartItem = $checkStmt->fetch();
-            $newQuantity = $cartItem['quantity'] + $data['quantity'];
-            
-            if ($menuItem['stock'] < $newQuantity) {
-                ApiResponse::error("Insufficient stock. Available: " . $menuItem['stock'], 400);
-            }
-            
-            $updateQuery = "UPDATE cart SET quantity = :quantity, updated_at = NOW() 
-                           WHERE id = :id";
-            $updateStmt = $this->db->prepare($updateQuery);
-            $updateStmt->bindParam(':quantity', $newQuantity);
-            $updateStmt->bindParam(':id', $cartItem['id']);
-            $updateStmt->execute();
-            
-            $this->logger->log($userId, 'UPDATE_CART', "Updated cart item: {$menuItem['name']}", $_SERVER['REMOTE_ADDR']);
-            
-            ApiResponse::success(null, "Cart updated successfully");
-        } else {
-            // Add new item
-            $insertQuery = "INSERT INTO cart (user_id, menu_item_id, quantity, created_at) 
-                           VALUES (:user_id, :menu_item_id, :quantity, NOW())";
-            $insertStmt = $this->db->prepare($insertQuery);
-            $insertStmt->bindParam(':user_id', $userId);
-            $insertStmt->bindParam(':menu_item_id', $data['menu_item_id']);
-            $insertStmt->bindParam(':quantity', $data['quantity']);
-            $insertStmt->execute();
-            
-            $this->logger->log($userId, 'ADD_TO_CART', "Added to cart: {$menuItem['name']}", $_SERVER['REMOTE_ADDR']);
-            
-            ApiResponse::success(null, "Item added to cart", 201);
-        }
-    }
-    
-    public function updateCartItem($userId, $cartId, $data) {
-        if (empty($data['quantity'])) {
-            ApiResponse::error("Quantity is required", 400);
-        }
-        
-        // Check if cart item belongs to user
-        $checkQuery = "SELECT c.*, m.stock, m.name FROM cart c 
-                      JOIN menu_items m ON c.menu_item_id = m.id
-                      WHERE c.id = :id AND c.user_id = :user_id";
-        $checkStmt = $this->db->prepare($checkQuery);
-        $checkStmt->bindParam(':id', $cartId);
-        $checkStmt->bindParam(':user_id', $userId);
-        $checkStmt->execute();
-        
-        if ($checkStmt->rowCount() === 0) {
-            ApiResponse::notFound("Cart item not found");
-        }
-        
-        $cartItem = $checkStmt->fetch();
-        
-        // Check stock
-        if ($cartItem['stock'] < $data['quantity']) {
-            ApiResponse::error("Insufficient stock. Available: " . $cartItem['stock'], 400);
-        }
-        
-        $updateQuery = "UPDATE cart SET quantity = :quantity, updated_at = NOW() WHERE id = :id";
-        $updateStmt = $this->db->prepare($updateQuery);
-        $updateStmt->bindParam(':quantity', $data['quantity']);
-        $updateStmt->bindParam(':id', $cartId);
-        
-        if ($updateStmt->execute()) {
-            $this->logger->log($userId, 'UPDATE_CART', "Updated cart item: {$cartItem['name']}", $_SERVER['REMOTE_ADDR']);
-            ApiResponse::success(null, "Cart item updated");
-        } else {
-            ApiResponse::error("Failed to update cart item", 500);
-        }
-    }
-    
-    public function removeFromCart($userId, $cartId) {
-        // Check if cart item belongs to user
-        $checkQuery = "SELECT c.*, m.name FROM cart c 
-                      JOIN menu_items m ON c.menu_item_id = m.id
-                      WHERE c.id = :id AND c.user_id = :user_id";
-        $checkStmt = $this->db->prepare($checkQuery);
-        $checkStmt->bindParam(':id', $cartId);
-        $checkStmt->bindParam(':user_id', $userId);
-        $checkStmt->execute();
-        
-        if ($checkStmt->rowCount() === 0) {
-            ApiResponse::notFound("Cart item not found");
-        }
-        
-        $cartItem = $checkStmt->fetch();
-        
-        $deleteQuery = "DELETE FROM cart WHERE id = :id";
-        $deleteStmt = $this->db->prepare($deleteQuery);
-        $deleteStmt->bindParam(':id', $cartId);
-        
-        if ($deleteStmt->execute()) {
-            $this->logger->log($userId, 'REMOVE_FROM_CART', "Removed from cart: {$cartItem['name']}", $_SERVER['REMOTE_ADDR']);
-            ApiResponse::success(null, "Item removed from cart");
-        } else {
-            ApiResponse::error("Failed to remove item", 500);
-        }
-    }
-    
-    public function clearCart($userId) {
-        $query = "DELETE FROM cart WHERE user_id = :user_id";
-        $stmt = $this->db->prepare($query);
-        $stmt->bindParam(':user_id', $userId);
-        
-        if ($stmt->execute()) {
-            $this->logger->log($userId, 'CLEAR_CART', "Cleared cart", $_SERVER['REMOTE_ADDR']);
-            ApiResponse::success(null, "Cart cleared");
-        } else {
-            ApiResponse::error("Failed to clear cart", 500);
-        }
-    }
-}
-
-// Order Management Class
-class OrderAPI {
-    private $db;
-    private $logger;
-    
-    public function __construct($db, $logger) {
-        $this->db = $db;
-        $this->logger = $logger;
-    }
-    
-    public function createOrder($userId, $data) {
-        try {
-            $this->db->beginTransaction();
-            
-            // Get cart items
-            $cartQuery = "SELECT c.*, m.name, m.price, m.stock 
-                         FROM cart c
-                         JOIN menu_items m ON c.menu_item_id = m.id
-                         WHERE c.user_id = :user_id AND m.status = 'available'";
-            $cartStmt = $this->db->prepare($cartQuery);
-            $cartStmt->bindParam(':user_id', $userId);
-            $cartStmt->execute();
-            
-            $cartItems = $cartStmt->fetchAll();
-            
-            if (count($cartItems) === 0) {
-                ApiResponse::error("Cart is empty", 400);
-            }
-            
-            // Calculate total
-            $totalAmount = 0;
-            foreach ($cartItems as $item) {
-                // Check stock
-                if ($item['stock'] < $item['quantity']) {
-                    ApiResponse::error("Insufficient stock for: " . $item['name'], 400);
-                }
-                $totalAmount += ($item['price'] * $item['quantity']);
-            }
-            
-            // Create order
-            $orderNumber = 'ORD-' . date('Ymd') . '-' . strtoupper(substr(uniqid(), -6));
-            $paymentMethod = isset($data['payment_method']) ? $data['payment_method'] : 'cash';
-            $customerName = isset($data['customer_name']) ? $data['customer_name'] : 'Guest';
-            $tableNumber = isset($data['table_number']) ? $data['table_number'] : null;
-            $notes = isset($data['notes']) ? $data['notes'] : null;
-            
-            $orderQuery = "INSERT INTO orders (order_number, user_id, customer_name, table_number, 
-                          total_amount, payment_method, payment_status, order_status, notes, created_at)
-                          VALUES (:order_number, :user_id, :customer_name, :table_number, 
-                          :total_amount, :payment_method, 'pending', 'pending', :notes, NOW())";
-            
-            $orderStmt = $this->db->prepare($orderQuery);
-            $orderStmt->bindParam(':order_number', $orderNumber);
-            $orderStmt->bindParam(':user_id', $userId);
-            $orderStmt->bindParam(':customer_name', $customerName);
-            $orderStmt->bindParam(':table_number', $tableNumber);
-            $orderStmt->bindParam(':total_amount', $totalAmount);
-            $orderStmt->bindParam(':payment_method', $paymentMethod);
-            $orderStmt->bindParam(':notes', $notes);
-            $orderStmt->execute();
-            
-            $orderId = $this->db->lastInsertId();
-            
-            // Create order items and update stock
-            $itemQuery = "INSERT INTO order_items (order_id, menu_item_id, quantity, price, subtotal)
-                         VALUES (:order_id, :menu_item_id, :quantity, :price, :subtotal)";
-            $itemStmt = $this->db->prepare($itemQuery);
-            
-            $stockQuery = "UPDATE menu_items SET stock = stock - :quantity WHERE id = :id";
-            $stockStmt = $this->db->prepare($stockQuery);
-            
-            foreach ($cartItems as $item) {
-                $subtotal = $item['price'] * $item['quantity'];
-                
-                $itemStmt->bindParam(':order_id', $orderId);
-                $itemStmt->bindParam(':menu_item_id', $item['menu_item_id']);
-                $itemStmt->bindParam(':quantity', $item['quantity']);
-                $itemStmt->bindParam(':price', $item['price']);
-                $itemStmt->bindParam(':subtotal', $subtotal);
-                $itemStmt->execute();
-                
-                $stockStmt->bindParam(':quantity', $item['quantity']);
-                $stockStmt->bindParam(':id', $item['menu_item_id']);
-                $stockStmt->execute();
-            }
-            
-            // Clear cart
-            $clearCartQuery = "DELETE FROM cart WHERE user_id = :user_id";
-            $clearCartStmt = $this->db->prepare($clearCartQuery);
-            $clearCartStmt->bindParam(':user_id', $userId);
-            $clearCartStmt->execute();
-            
-            $this->db->commit();
-            
-            $this->logger->log($userId, 'CREATE_ORDER', "Created order: $orderNumber", $_SERVER['REMOTE_ADDR']);
-            
-            ApiResponse::success([
-                'order_id' => $orderId,
-                'order_number' => $orderNumber,
-                'total_amount' => $totalAmount
-            ], "Order created successfully", 201);
-            
-        } catch (Exception $e) {
-            $this->db->rollBack();
-            ApiResponse::error("Failed to create order: " . $e->getMessage(), 500);
-        }
-    }
-    
-    public function getOrders($filters = []) {
-        $query = "SELECT o.*, u.username as cashier_name,
-                  COUNT(oi.id) as total_items
-                  FROM orders o
-                  LEFT JOIN users u ON o.user_id = u.id
-                  LEFT JOIN order_items oi ON o.id = oi.order_id
-                  WHERE 1=1";
-        
-        $params = [];
-        
-        if (!empty($filters['user_id'])) {
-            $query .= " AND o.user_id = :user_id";
-            $params[':user_id'] = $filters['user_id'];
-        }
-        
-        if (!empty($filters['order_status'])) {
-            $query .= " AND o.order_status = :order_status";
-            $params[':order_status'] = $filters['order_status'];
-        }
-        
-        if (!empty($filters['payment_status'])) {
-            $query .= " AND o.payment_status = :payment_status";
-            $params[':payment_status'] = $filters['payment_status'];
-        }
-        
-        if (!empty($filters['date_from'])) {
-            $query .= " AND DATE(o.created_at) >= :date_from";
-            $params[':date_from'] = $filters['date_from'];
-        }
-        
-        if (!empty($filters['date_to'])) {
-            $query .= " AND DATE(o.created_at) <= :date_to";
-            $params[':date_to'] = $filters['date_to'];
-        }
-        
-        $query .= " GROUP BY o.id ORDER BY o.created_at DESC";
-        
-        if (!empty($filters['limit'])) {
-            $query .= " LIMIT :limit";
-        }
-        
-        $stmt = $this->db->prepare($query);
-        
-        foreach ($params as $key => $value) {
-            $stmt->bindValue($key, $value);
-        }
-        
-        if (!empty($filters['limit'])) {
-            $stmt->bindValue(':limit', (int)$filters['limit'], PDO::PARAM_INT);
-        }
-        
-        $stmt->execute();
-        $orders = $stmt->fetchAll();
-        
-        ApiResponse::success([
-            'orders' => $orders,
-            'total' => count($orders)
-        ]);
-    }
-    
-    public function getOrderById($id) {
-        $query = "SELECT o.*, u.username as cashier_name
-                  FROM orders o
-                  LEFT JOIN users u ON o.user_id = u.id
-                  WHERE o.id = :id";
-        
-        $stmt = $this->db->prepare($query);
-        $stmt->bindParam(':id', $id);
-        $stmt->execute();
-        
-        $order = $stmt->fetch();
-        
-        if (!$order) {
-            ApiResponse::notFound("Order not found");
-        }
-        
-        // Get order items
-        $itemsQuery = "SELECT oi.*, m.name, m.image
-                      FROM order_items oi
-                      JOIN menu_items m ON oi.menu_item_id = m.id
-                      WHERE oi.order_id = :order_id";
-        
-        $itemsStmt = $this->db->prepare($itemsQuery);
-        $itemsStmt->bindParam(':order_id', $id);
-        $itemsStmt->execute();
-        
-        $order['items'] = $itemsStmt->fetchAll();
-        
-        ApiResponse::success($order);
-    }
-    
-    public function updateOrderStatus($id, $data) {
-        if (empty($data['order_status'])) {
-            ApiResponse::error("Order status is required", 400);
-        }
-        
-        $allowedStatuses = ['pending', 'processing', 'completed', 'cancelled'];
-        if (!in_array($data['order_status'], $allowedStatuses)) {
-            ApiResponse::error("Invalid order status", 400);
-        }
-        
-        $query = "UPDATE orders SET order_status = :order_status, updated_at = NOW() 
-                  WHERE id = :id";
-        
-        $stmt = $this->db->prepare($query);
-        $stmt->bindParam(':order_status', $data['order_status']);
-        $stmt->bindParam(':id', $id);
-        
-        if ($stmt->execute()) {
-            $this->logger->log($_SESSION['user_id'], 'UPDATE_ORDER_STATUS', 
-                             "Updated order #$id status to: {$data['order_status']}", 
-                             $_SERVER['REMOTE_ADDR']);
-            ApiResponse::success(null, "Order status updated");
-        } else {
-            ApiResponse::error("Failed to update order status", 500);
-        }
-    }
-    
-    public function updatePaymentStatus($id, $data) {
-        if (empty($data['payment_status'])) {
-            ApiResponse::error("Payment status is required", 400);
-        }
-        
-        $allowedStatuses = ['pending', 'paid', 'refunded'];
-        if (!in_array($data['payment_status'], $allowedStatuses)) {
-            ApiResponse::error("Invalid payment status", 400);
-        }
-        
-        $query = "UPDATE orders SET payment_status = :payment_status, updated_at = NOW() 
-                  WHERE id = :id";
-        
-        $stmt = $this->db->prepare($query);
-        $stmt->bindParam(':payment_status', $data['payment_status']);
-        $stmt->bindParam(':id', $id);
-        
-        if ($stmt->execute()) {
-            $this->logger->log($_SESSION['user_id'], 'UPDATE_PAYMENT_STATUS', 
-                             "Updated order #$id payment status to: {$data['payment_status']}", 
-                             $_SERVER['REMOTE_ADDR']);
-            ApiResponse::success(null, "Payment status updated");
-        } else {
-            ApiResponse::error("Failed to update payment status", 500);
-        }
-    }
-}
-
-// Statistics & Dashboard API
-class StatsAPI {
-    private $db;
-    
-    public function __construct($db) {
-        $this->db = $db;
-    }
-    
-    public function getDashboardStats() {
-        $stats = [];
-        
-        // Today's revenue
-        $revenueQuery = "SELECT COALESCE(SUM(total_amount), 0) as today_revenue
-                        FROM orders 
-                        WHERE DATE(created_at) = CURDATE() 
-                        AND payment_status = 'paid'";
-        $revenueStmt = $this->db->query($revenueQuery);
-        $stats['today_revenue'] = $revenueStmt->fetch()['today_revenue'];
-        
-        // Today's orders
-        $ordersQuery = "SELECT COUNT(*) as today_orders
-                       FROM orders 
-                       WHERE DATE(created_at) = CURDATE()";
-        $ordersStmt = $this->db->query($ordersQuery);
-        $stats['today_orders'] = $ordersStmt->fetch()['today_orders'];
-        
-        // Pending orders
-        $pendingQuery = "SELECT COUNT(*) as pending_orders
-                        FROM orders 
-                        WHERE order_status = 'pending'";
-        $pendingStmt = $this->db->query($pendingQuery);
-        $stats['pending_orders'] = $pendingStmt->fetch()['pending_orders'];
-        
-        // Total menu items
-        $menuQuery = "SELECT COUNT(*) as total_menu
-                     FROM menu_items 
-                     WHERE status = 'available'";
-        $menuStmt = $this->db->query($menuQuery);
-        $stats['total_menu'] = $menuStmt->fetch()['total_menu'];
-        
-        // Monthly revenue
-        $monthlyQuery = "SELECT COALESCE(SUM(total_amount), 0) as monthly_revenue
-                        FROM orders 
-                        WHERE MONTH(created_at) = MONTH(CURDATE()) 
-                        AND YEAR(created_at) = YEAR(CURDATE())
-                        AND payment_status = 'paid'";
-        $monthlyStmt = $this->db->query($monthlyQuery);
-        $stats['monthly_revenue'] = $monthlyStmt->fetch()['monthly_revenue'];
-        
-        // Top selling items
-        $topItemsQuery = "SELECT m.name, m.image, SUM(oi.quantity) as total_sold,
-                         SUM(oi.subtotal) as total_revenue
-                         FROM order_items oi
-                         JOIN menu_items m ON oi.menu_item_id = m.id
-                         JOIN orders o ON oi.order_id = o.id
-                         WHERE o.payment_status = 'paid'
-                         AND DATE(o.created_at) >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
-                         GROUP BY oi.menu_item_id
-                         ORDER BY total_sold DESC
-                         LIMIT 5";
-        $topItemsStmt = $this->db->query($topItemsQuery);
-        $stats['top_items'] = $topItemsStmt->fetchAll();
-        
-        // Recent orders
-        $recentQuery = "SELECT o.*, u.username as cashier_name
-                       FROM orders o
-                       LEFT JOIN users u ON o.user_id = u.id
-                       ORDER BY o.created_at DESC
-                       LIMIT 10";
-        $recentStmt = $this->db->query($recentQuery);
-        $stats['recent_orders'] = $recentStmt->fetchAll();
-        
-        ApiResponse::success($stats);
-    }
-    
-    public function getSalesReport($filters = []) {
-        $dateFrom = isset($filters['date_from']) ? $filters['date_from'] : date('Y-m-01');
-        $dateTo = isset($filters['date_to']) ? $filters['date_to'] : date('Y-m-d');
-        
-        // Daily sales
-        $dailyQuery = "SELECT DATE(created_at) as date, 
-                      COUNT(*) as total_orders,
-                      SUM(total_amount) as total_revenue
-                      FROM orders
-                      WHERE DATE(created_at) BETWEEN :date_from AND :date_to
-                      AND payment_status = 'paid'
-                      GROUP BY DATE(created_at)
-                      ORDER BY date ASC";
-        
-        $dailyStmt = $this->db->prepare($dailyQuery);
-        $dailyStmt->bindParam(':date_from', $dateFrom);
-        $dailyStmt->bindParam(':date_to', $dateTo);
-        $dailyStmt->execute();
-        
-        $report = [
-            'period' => [
-                'from' => $dateFrom,
-                'to' => $dateTo
-            ],
-            'daily_sales' => $dailyStmt->fetchAll(),
-            'summary' => []
-        ];
-        
-        // Summary
-        $summaryQuery = "SELECT 
-                        COUNT(*) as total_orders,
-                        SUM(total_amount) as total_revenue,
-                        AVG(total_amount) as average_order,
-                        MAX(total_amount) as highest_order,
-                        MIN(total_amount) as lowest_order
-                        FROM orders
-                        WHERE DATE(created_at) BETWEEN :date_from AND :date_to
-                        AND payment_status = 'paid'";
-        
-        $summaryStmt = $this->db->prepare($summaryQuery);
-        $summaryStmt->bindParam(':date_from', $dateFrom);
-        $summaryStmt->bindParam(':date_to', $dateTo);
-        $summaryStmt->execute();
-        
-        $report['summary'] = $summaryStmt->fetch();
-        
-        ApiResponse::success($report);
-    }
-}
-
-// Initialize
-$database = new Database();
-$db = $database->getConnection();
-
-if (!$db) {
-    ApiResponse::error("Database connection failed", 500);
-}
-
-$logger = new ActivityLogger($db);
-$auth = new Auth($db, $logger);
-$menuAPI = new MenuAPI($db, $logger);
-$cartAPI = new CartAPI($db, $logger);
-$orderAPI = new OrderAPI($db, $logger);
-$statsAPI = new StatsAPI($db);
-
-// Get request method and endpoint
 $method = $_SERVER['REQUEST_METHOD'];
 $endpoint = isset($_GET['endpoint']) ? $_GET['endpoint'] : '';
-$data = json_decode(file_get_contents('php://input'), true);
 
-// Merge with $_POST for form data
-if (!empty($_POST)) {
-    $data = array_merge($data ?: [], $_POST);
-}
-
-// Route Handler
 try {
     switch ($endpoint) {
-        // Authentication endpoints
-        case 'register':
-            if ($method === 'POST') {
-                $auth->register($data);
-            }
-            break;
-            
-        case 'login':
-            if ($method === 'POST') {
-                $auth->login($data);
-            }
-            break;
-            
-        case 'logout':
-            if ($method === 'POST') {
-                $auth->logout();
-            }
-            break;
         
-        // Menu endpoints
+        // ==================== MENU ENDPOINTS ====================
         case 'menu':
-            if ($method === 'GET') {
-                $menuAPI->getAll($_GET);
-            } elseif ($method === 'POST') {
-                $auth->checkRole(['admin', 'manager']);
-                $menuAPI->create($data);
-            }
+            handleMenu($pdo, $method);
             break;
             
-        case 'menu/item':
-            $id = isset($_GET['id']) ? $_GET['id'] : null;
-            if (!$id) {
-                ApiResponse::error("Menu item ID is required", 400);
-            }
-            
-            if ($method === 'GET') {
-                $menuAPI->getById($id);
-            } elseif ($method === 'PUT') {
-                $auth->checkRole(['admin', 'manager']);
-                $menuAPI->update($id, $data);
-            } elseif ($method === 'DELETE') {
-                $auth->checkRole(['admin', 'manager']);
-                $menuAPI->delete($id);
-            }
-            break;
-        
-        // Cart endpoints
-        case 'cart':
-            $userId = $auth->checkAuth();
-            
-            if ($method === 'GET') {
-                $cartAPI->getCart($userId);
-            } elseif ($method === 'POST') {
-                $cartAPI->addToCart($userId, $data);
-            } elseif ($method === 'DELETE') {
-                $cartAPI->clearCart($userId);
-            }
+        // ==================== TABLES ENDPOINTS ====================
+        case 'tables':
+            handleTables($pdo, $method);
             break;
             
-        case 'cart/item':
-            $userId = $auth->checkAuth();
-            $cartId = isset($_GET['id']) ? $_GET['id'] : null;
-            
-            if (!$cartId) {
-                ApiResponse::error("Cart item ID is required", 400);
-            }
-            
-            if ($method === 'PUT') {
-                $cartAPI->updateCartItem($userId, $cartId, $data);
-            } elseif ($method === 'DELETE') {
-                $cartAPI->removeFromCart($userId, $cartId);
-            }
-            break;
-        
-        // Order endpoints
+        // ==================== ORDERS ENDPOINTS ====================
         case 'orders':
-            $userId = $auth->checkAuth();
-            
-            if ($method === 'GET') {
-                // Admin/Manager can see all orders
-                if (in_array($_SESSION['role'], ['admin', 'manager'])) {
-                    $orderAPI->getOrders($_GET);
-                } else {
-                    // Cashier only sees their own orders
-                    $_GET['user_id'] = $userId;
-                    $orderAPI->getOrders($_GET);
-                }
-            } elseif ($method === 'POST') {
-                $orderAPI->createOrder($userId, $data);
-            }
+            handleOrders($pdo, $method);
             break;
             
-        case 'orders/item':
-            $auth->checkAuth();
-            $id = isset($_GET['id']) ? $_GET['id'] : null;
-            
-            if (!$id) {
-                ApiResponse::error("Order ID is required", 400);
-            }
-            
-            if ($method === 'GET') {
-                $orderAPI->getOrderById($id);
-            }
+        // ==================== ORDER DETAILS ENDPOINTS ====================
+        case 'order_details':
+            handleOrderDetails($pdo, $method);
             break;
             
-        case 'orders/status':
-            $auth->checkRole(['admin', 'manager', 'cashier']);
-            $id = isset($_GET['id']) ? $_GET['id'] : null;
-            
-            if (!$id) {
-                ApiResponse::error("Order ID is required", 400);
-            }
-            
-            if ($method === 'PUT') {
-                $orderAPI->updateOrderStatus($id, $data);
-            }
+        // ==================== USERS ENDPOINTS ====================
+        case 'users':
+            handleUsers($pdo, $method);
             break;
             
-        case 'orders/payment':
-            $auth->checkRole(['admin', 'manager', 'cashier']);
-            $id = isset($_GET['id']) ? $_GET['id'] : null;
-            
-            if (!$id) {
-                ApiResponse::error("Order ID is required", 400);
-            }
-            
-            if ($method === 'PUT') {
-                $orderAPI->updatePaymentStatus($id, $data);
-            }
-            break;
-        
-        // Statistics endpoints
-        case 'stats/dashboard':
-            $auth->checkAuth();
-            if ($method === 'GET') {
-                $statsAPI->getDashboardStats();
-            }
-            break;
-            
-        case 'stats/sales':
-            $auth->checkRole(['admin', 'manager']);
-            if ($method === 'GET') {
-                $statsAPI->getSalesReport($_GET);
-            }
-            break;
-        
-        // Health check
-        case 'health':
-            ApiResponse::success([
-                'status' => 'healthy',
-                'database' => 'connected',
-                'version' => '1.0.0'
-            ]);
+        // ==================== DASHBOARD/STATISTICS ====================
+        case 'dashboard':
+            handleDashboard($pdo, $method);
             break;
             
         default:
-            ApiResponse::error("Endpoint not found: $endpoint", 404);
+            echo json_encode([
+                "status" => "error",
+                "message" => "Endpoint tidak ditemukan. Gunakan: menu, tables, orders, order_details, users, dashboard"
+            ]);
+            break;
+    }
+} catch (Exception $e) {
+    echo json_encode([
+        "status" => "error",
+        "message" => "Terjadi kesalahan: " . $e->getMessage()
+    ]);
+}
+
+// ==================== MENU FUNCTIONS ====================
+function handleMenu($pdo, $method) {
+    switch ($method) {
+        case 'GET':
+            if (isset($_GET['id'])) {
+                $id = intval($_GET['id']);
+                $stmt = $pdo->prepare("SELECT * FROM menu WHERE id = ?");
+                $stmt->execute([$id]);
+                $data = $stmt->fetch(PDO::FETCH_ASSOC);
+                
+                if ($data) {
+                    echo json_encode(["status" => "success", "data" => $data]);
+                } else {
+                    echo json_encode(["status" => "error", "message" => "Menu tidak ditemukan"]);
+                }
+            } else {
+                // Filter berdasarkan kategori jika ada
+                if (isset($_GET['category'])) {
+                    $category = $_GET['category'];
+                    $stmt = $pdo->prepare("SELECT * FROM menu WHERE category = ? ORDER BY name ASC");
+                    $stmt->execute([$category]);
+                } else {
+                    $stmt = $pdo->query("SELECT * FROM menu ORDER BY category, name ASC");
+                }
+                $data = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                echo json_encode(["status" => "success", "data" => $data]);
+            }
+            break;
+            
+        case 'POST':
+            $input = json_decode(file_get_contents("php://input"), true);
+            if (!isset($input['name'], $input['price'], $input['category'])) {
+                echo json_encode(["status" => "error", "message" => "Data tidak lengkap (name, price, category diperlukan)"]);
+                exit;
+            }
+            
+            $stmt = $pdo->prepare("INSERT INTO menu (name, description, price, category, stock, image) VALUES (?, ?, ?, ?, ?, ?)");
+            $result = $stmt->execute([
+                $input['name'],
+                $input['description'] ?? null,
+                $input['price'],
+                $input['category'],
+                $input['stock'] ?? 100,
+                $input['image'] ?? null
+            ]);
+            
+            echo json_encode([
+                "status" => $result ? "success" : "error",
+                "message" => $result ? "Menu berhasil ditambahkan" : "Gagal menambahkan menu",
+                "id" => $result ? $pdo->lastInsertId() : null
+            ]);
+            break;
+            
+        case 'PUT':
+            $input = json_decode(file_get_contents("php://input"), true);
+            if (!isset($input['id'])) {
+                echo json_encode(["status" => "error", "message" => "ID tidak ditemukan"]);
+                exit;
+            }
+            
+            $updateFields = [];
+            $params = [];
+            
+            if (isset($input['name'])) {
+                $updateFields[] = "name = ?";
+                $params[] = $input['name'];
+            }
+            if (isset($input['description'])) {
+                $updateFields[] = "description = ?";
+                $params[] = $input['description'];
+            }
+            if (isset($input['price'])) {
+                $updateFields[] = "price = ?";
+                $params[] = $input['price'];
+            }
+            if (isset($input['category'])) {
+                $updateFields[] = "category = ?";
+                $params[] = $input['category'];
+            }
+            if (isset($input['stock'])) {
+                $updateFields[] = "stock = ?";
+                $params[] = $input['stock'];
+            }
+            if (isset($input['image'])) {
+                $updateFields[] = "image = ?";
+                $params[] = $input['image'];
+            }
+            
+            $params[] = $input['id'];
+            
+            $stmt = $pdo->prepare("UPDATE menu SET " . implode(", ", $updateFields) . " WHERE id = ?");
+            $result = $stmt->execute($params);
+            
+            echo json_encode([
+                "status" => $result ? "success" : "error",
+                "message" => $result ? "Menu berhasil diupdate" : "Gagal mengupdate menu"
+            ]);
+            break;
+            
+        case 'DELETE':
+            $input = json_decode(file_get_contents("php://input"), true);
+            if (!isset($input['id'])) {
+                echo json_encode(["status" => "error", "message" => "ID tidak ditemukan"]);
+                exit;
+            }
+            
+            $stmt = $pdo->prepare("DELETE FROM menu WHERE id = ?");
+            $result = $stmt->execute([$input['id']]);
+            
+            echo json_encode([
+                "status" => $result ? "success" : "error",
+                "message" => $result ? "Menu berhasil dihapus" : "Gagal menghapus menu"
+            ]);
+            break;
+    }
+}
+
+// ==================== TABLES FUNCTIONS ====================
+function handleTables($pdo, $method) {
+    switch ($method) {
+        case 'GET':
+            if (isset($_GET['id'])) {
+                $id = intval($_GET['id']);
+                $stmt = $pdo->prepare("SELECT * FROM tables WHERE id = ?");
+                $stmt->execute([$id]);
+                $data = $stmt->fetch(PDO::FETCH_ASSOC);
+                
+                if ($data) {
+                    echo json_encode(["status" => "success", "data" => $data]);
+                } else {
+                    echo json_encode(["status" => "error", "message" => "Meja tidak ditemukan"]);
+                }
+            } else {
+                // Filter berdasarkan status jika ada
+                if (isset($_GET['status'])) {
+                    $status = $_GET['status'];
+                    $stmt = $pdo->prepare("SELECT * FROM tables WHERE status = ? ORDER BY table_number ASC");
+                    $stmt->execute([$status]);
+                } else {
+                    $stmt = $pdo->query("SELECT * FROM tables ORDER BY table_number ASC");
+                }
+                $data = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                echo json_encode(["status" => "success", "data" => $data]);
+            }
+            break;
+            
+        case 'POST':
+            $input = json_decode(file_get_contents("php://input"), true);
+            if (!isset($input['table_number'], $input['capacity'])) {
+                echo json_encode(["status" => "error", "message" => "Data tidak lengkap (table_number, capacity diperlukan)"]);
+                exit;
+            }
+            
+            $stmt = $pdo->prepare("INSERT INTO tables (table_number, capacity, status) VALUES (?, ?, ?)");
+            $result = $stmt->execute([
+                $input['table_number'],
+                $input['capacity'],
+                $input['status'] ?? 'available'
+            ]);
+            
+            echo json_encode([
+                "status" => $result ? "success" : "error",
+                "message" => $result ? "Meja berhasil ditambahkan" : "Gagal menambahkan meja",
+                "id" => $result ? $pdo->lastInsertId() : null
+            ]);
+            break;
+            
+        case 'PUT':
+            $input = json_decode(file_get_contents("php://input"), true);
+            if (!isset($input['id'])) {
+                echo json_encode(["status" => "error", "message" => "ID tidak ditemukan"]);
+                exit;
+            }
+            
+            $updateFields = [];
+            $params = [];
+            
+            if (isset($input['table_number'])) {
+                $updateFields[] = "table_number = ?";
+                $params[] = $input['table_number'];
+            }
+            if (isset($input['capacity'])) {
+                $updateFields[] = "capacity = ?";
+                $params[] = $input['capacity'];
+            }
+            if (isset($input['status'])) {
+                $updateFields[] = "status = ?";
+                $params[] = $input['status'];
+            }
+            
+            $params[] = $input['id'];
+            
+            $stmt = $pdo->prepare("UPDATE tables SET " . implode(", ", $updateFields) . " WHERE id = ?");
+            $result = $stmt->execute($params);
+            
+            echo json_encode([
+                "status" => $result ? "success" : "error",
+                "message" => $result ? "Meja berhasil diupdate" : "Gagal mengupdate meja"
+            ]);
+            break;
+            
+        case 'DELETE':
+            $input = json_decode(file_get_contents("php://input"), true);
+            if (!isset($input['id'])) {
+                echo json_encode(["status" => "error", "message" => "ID tidak ditemukan"]);
+                exit;
+            }
+            
+            $stmt = $pdo->prepare("DELETE FROM tables WHERE id = ?");
+            $result = $stmt->execute([$input['id']]);
+            
+            echo json_encode([
+                "status" => $result ? "success" : "error",
+                "message" => $result ? "Meja berhasil dihapus" : "Gagal menghapus meja"
+            ]);
+            break;
+    }
+}
+
+// ==================== ORDERS FUNCTIONS ====================
+function handleOrders($pdo, $method) {
+    switch ($method) {
+        case 'GET':
+            if (isset($_GET['id'])) {
+                $id = intval($_GET['id']);
+                // Get order dengan detail items
+                $stmt = $pdo->prepare("
+                    SELECT o.*, t.table_number, u.username as cashier_name
+                    FROM orders o
+                    LEFT JOIN tables t ON o.table_id = t.id
+                    LEFT JOIN users u ON o.user_id = u.id
+                    WHERE o.id = ?
+                ");
+                $stmt->execute([$id]);
+                $order = $stmt->fetch(PDO::FETCH_ASSOC);
+                
+                if ($order) {
+                    // Get order details
+                    $stmt = $pdo->prepare("
+                        SELECT od.*, m.name as menu_name, m.price as menu_price
+                        FROM order_details od
+                        JOIN menu m ON od.menu_id = m.id
+                        WHERE od.order_id = ?
+                    ");
+                    $stmt->execute([$id]);
+                    $order['items'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                    
+                    echo json_encode(["status" => "success", "data" => $order]);
+                } else {
+                    echo json_encode(["status" => "error", "message" => "Order tidak ditemukan"]);
+                }
+            } else {
+                // Get all orders dengan filter opsional
+                $query = "
+                    SELECT o.*, t.table_number, u.username as cashier_name
+                    FROM orders o
+                    LEFT JOIN tables t ON o.table_id = t.id
+                    LEFT JOIN users u ON o.user_id = u.id
+                    WHERE 1=1
+                ";
+                $params = [];
+                
+                if (isset($_GET['status'])) {
+                    $query .= " AND o.status = ?";
+                    $params[] = $_GET['status'];
+                }
+                
+                if (isset($_GET['date'])) {
+                    $query .= " AND DATE(o.order_date) = ?";
+                    $params[] = $_GET['date'];
+                }
+                
+                $query .= " ORDER BY o.order_date DESC";
+                
+                $stmt = $pdo->prepare($query);
+                $stmt->execute($params);
+                $data = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                
+                echo json_encode(["status" => "success", "data" => $data]);
+            }
+            break;
+            
+        case 'POST':
+            $input = json_decode(file_get_contents("php://input"), true);
+            if (!isset($input['table_id'], $input['items']) || !is_array($input['items'])) {
+                echo json_encode(["status" => "error", "message" => "Data tidak lengkap (table_id, items diperlukan)"]);
+                exit;
+            }
+            
+            try {
+                $pdo->beginTransaction();
+                
+                // Calculate total
+                $total = 0;
+                foreach ($input['items'] as $item) {
+                    $total += $item['price'] * $item['quantity'];
+                }
+                
+                // Insert order
+                $stmt = $pdo->prepare("
+                    INSERT INTO orders (table_id, user_id, order_date, total_amount, status, payment_method)
+                    VALUES (?, ?, NOW(), ?, ?, ?)
+                ");
+                $stmt->execute([
+                    $input['table_id'],
+                    $input['user_id'] ?? null,
+                    $total,
+                    $input['status'] ?? 'pending',
+                    $input['payment_method'] ?? 'cash'
+                ]);
+                
+                $orderId = $pdo->lastInsertId();
+                
+                // Insert order details
+                $stmt = $pdo->prepare("
+                    INSERT INTO order_details (order_id, menu_id, quantity, price, subtotal)
+                    VALUES (?, ?, ?, ?, ?)
+                ");
+                
+                foreach ($input['items'] as $item) {
+                    $subtotal = $item['price'] * $item['quantity'];
+                    $stmt->execute([
+                        $orderId,
+                        $item['menu_id'],
+                        $item['quantity'],
+                        $item['price'],
+                        $subtotal
+                    ]);
+                }
+                
+                // Update table status
+                $stmt = $pdo->prepare("UPDATE tables SET status = 'occupied' WHERE id = ?");
+                $stmt->execute([$input['table_id']]);
+                
+                $pdo->commit();
+                
+                echo json_encode([
+                    "status" => "success",
+                    "message" => "Order berhasil dibuat",
+                    "order_id" => $orderId
+                ]);
+            } catch (Exception $e) {
+                $pdo->rollBack();
+                echo json_encode([
+                    "status" => "error",
+                    "message" => "Gagal membuat order: " . $e->getMessage()
+                ]);
+            }
+            break;
+            
+        case 'PUT':
+            $input = json_decode(file_get_contents("php://input"), true);
+            if (!isset($input['id'])) {
+                echo json_encode(["status" => "error", "message" => "ID tidak ditemukan"]);
+                exit;
+            }
+            
+            try {
+                $pdo->beginTransaction();
+                
+                $updateFields = [];
+                $params = [];
+                
+                if (isset($input['status'])) {
+                    $updateFields[] = "status = ?";
+                    $params[] = $input['status'];
+                    
+                    // Jika status completed, update table status
+                    if ($input['status'] == 'completed') {
+                        $stmt = $pdo->prepare("SELECT table_id FROM orders WHERE id = ?");
+                        $stmt->execute([$input['id']]);
+                        $order = $stmt->fetch(PDO::FETCH_ASSOC);
+                        
+                        if ($order) {
+                            $stmt = $pdo->prepare("UPDATE tables SET status = 'available' WHERE id = ?");
+                            $stmt->execute([$order['table_id']]);
+                        }
+                    }
+                }
+                
+                if (isset($input['payment_method'])) {
+                    $updateFields[] = "payment_method = ?";
+                    $params[] = $input['payment_method'];
+                }
+                
+                if (isset($input['total_amount'])) {
+                    $updateFields[] = "total_amount = ?";
+                    $params[] = $input['total_amount'];
+                }
+                
+                $params[] = $input['id'];
+                
+                if (!empty($updateFields)) {
+                    $stmt = $pdo->prepare("UPDATE orders SET " . implode(", ", $updateFields) . " WHERE id = ?");
+                    $stmt->execute($params);
+                }
+                
+                $pdo->commit();
+                
+                echo json_encode([
+                    "status" => "success",
+                    "message" => "Order berhasil diupdate"
+                ]);
+            } catch (Exception $e) {
+                $pdo->rollBack();
+                echo json_encode([
+                    "status" => "error",
+                    "message" => "Gagal mengupdate order: " . $e->getMessage()
+                ]);
+            }
+            break;
+            
+        case 'DELETE':
+            $input = json_decode(file_get_contents("php://input"), true);
+            if (!isset($input['id'])) {
+                echo json_encode(["status" => "error", "message" => "ID tidak ditemukan"]);
+                exit;
+            }
+            
+            try {
+                $pdo->beginTransaction();
+                
+                // Get table_id before delete
+                $stmt = $pdo->prepare("SELECT table_id FROM orders WHERE id = ?");
+                $stmt->execute([$input['id']]);
+                $order = $stmt->fetch(PDO::FETCH_ASSOC);
+                
+                // Delete order details first
+                $stmt = $pdo->prepare("DELETE FROM order_details WHERE order_id = ?");
+                $stmt->execute([$input['id']]);
+                
+                // Delete order
+                $stmt = $pdo->prepare("DELETE FROM orders WHERE id = ?");
+                $result = $stmt->execute([$input['id']]);
+                
+                // Update table status
+                if ($order) {
+                    $stmt = $pdo->prepare("UPDATE tables SET status = 'available' WHERE id = ?");
+                    $stmt->execute([$order['table_id']]);
+                }
+                
+                $pdo->commit();
+                
+                echo json_encode([
+                    "status" => $result ? "success" : "error",
+                    "message" => $result ? "Order berhasil dihapus" : "Gagal menghapus order"
+                ]);
+            } catch (Exception $e) {
+                $pdo->rollBack();
+                echo json_encode([
+                    "status" => "error",
+                    "message" => "Gagal menghapus order: " . $e->getMessage()
+                ]);
+            }
+            break;
+    }
+}
+
+// ==================== ORDER DETAILS FUNCTIONS ====================
+function handleOrderDetails($pdo, $method) {
+    switch ($method) {
+        case 'GET':
+            if (isset($_GET['order_id'])) {
+                $orderId = intval($_GET['order_id']);
+                $stmt = $pdo->prepare("
+                    SELECT od.*, m.name as menu_name, m.price as menu_price, m.category
+                    FROM order_details od
+                    JOIN menu m ON od.menu_id = m.id
+                    WHERE od.order_id = ?
+                ");
+                $stmt->execute([$orderId]);
+                $data = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                echo json_encode(["status" => "success", "data" => $data]);
+            } else {
+                echo json_encode(["status" => "error", "message" => "order_id diperlukan"]);
+            }
+            break;
+            
+        case 'POST':
+            $input = json_decode(file_get_contents("php://input"), true);
+            if (!isset($input['order_id'], $input['menu_id'], $input['quantity'], $input['price'])) {
+                echo json_encode(["status" => "error", "message" => "Data tidak lengkap"]);
+                exit;
+            }
+            
+            $subtotal = $input['price'] * $input['quantity'];
+            
+            $stmt = $pdo->prepare("
+                INSERT INTO order_details (order_id, menu_id, quantity, price, subtotal)
+                VALUES (?, ?, ?, ?, ?)
+            ");
+            $result = $stmt->execute([
+                $input['order_id'],
+                $input['menu_id'],
+                $input['quantity'],
+                $input['price'],
+                $subtotal
+            ]);
+            
+            // Update total order
+            if ($result) {
+                $stmt = $pdo->prepare("
+                    UPDATE orders 
+                    SET total_amount = (SELECT SUM(subtotal) FROM order_details WHERE order_id = ?)
+                    WHERE id = ?
+                ");
+                $stmt->execute([$input['order_id'], $input['order_id']]);
+            }
+            
+            echo json_encode([
+                "status" => $result ? "success" : "error",
+                "message" => $result ? "Item berhasil ditambahkan" : "Gagal menambahkan item",
+                "id" => $result ? $pdo->lastInsertId() : null
+            ]);
+            break;
+            
+        case 'PUT':
+            $input = json_decode(file_get_contents("php://input"), true);
+            if (!isset($input['id'], $input['quantity'])) {
+                echo json_encode(["status" => "error", "message" => "ID dan quantity diperlukan"]);
+                exit;
+            }
+            
+            // Get current price
+            $stmt = $pdo->prepare("SELECT price, order_id FROM order_details WHERE id = ?");
+            $stmt->execute([$input['id']]);
+            $detail = $stmt->fetch(PDO::FETCH_ASSOC);
+            
+            if ($detail) {
+                $subtotal = $detail['price'] * $input['quantity'];
+                
+                $stmt = $pdo->prepare("UPDATE order_details SET quantity = ?, subtotal = ? WHERE id = ?");
+                $result = $stmt->execute([$input['quantity'], $subtotal, $input['id']]);
+                
+                // Update total order
+                if ($result) {
+                    $stmt = $pdo->prepare("
+                        UPDATE orders 
+                        SET total_amount = (SELECT SUM(subtotal) FROM order_details WHERE order_id = ?)
+                        WHERE id = ?
+                    ");
+                    $stmt->execute([$detail['order_id'], $detail['order_id']]);
+                }
+                
+                echo json_encode([
+                    "status" => $result ? "success" : "error",
+                    "message" => $result ? "Item berhasil diupdate" : "Gagal mengupdate item"
+                ]);
+            } else {
+                echo json_encode(["status" => "error", "message" => "Item tidak ditemukan"]);
+            }
+            break;
+            
+        case 'DELETE':
+            $input = json_decode(file_get_contents("php://input"), true);
+            if (!isset($input['id'])) {
+                echo json_encode(["status" => "error", "message" => "ID tidak ditemukan"]);
+                exit;
+            }
+            
+            // Get order_id before delete
+            $stmt = $pdo->prepare("SELECT order_id FROM order_details WHERE id = ?");
+            $stmt->execute([$input['id']]);
+            $detail = $stmt->fetch(PDO::FETCH_ASSOC);
+            
+            $stmt = $pdo->prepare("DELETE FROM order_details WHERE id = ?");
+            $result = $stmt->execute([$input['id']]);
+            
+            // Update total order
+            if ($result && $detail) {
+                $stmt = $pdo->prepare("
+                    UPDATE orders 
+                    SET total_amount = (SELECT COALESCE(SUM(subtotal), 0) FROM order_details WHERE order_id = ?)
+                    WHERE id = ?
+                ");
+                $stmt->execute([$detail['order_id'], $detail['order_id']]);
+            }
+            
+            echo json_encode([
+                "status" => $result ? "success" : "error",
+                "message" => $result ? "Item berhasil dihapus" : "Gagal menghapus item"
+            ]);
+            break;
+    }
+}
+
+// ==================== USERS FUNCTIONS ====================
+function handleUsers($pdo, $method) {
+    switch ($method) {
+        case 'GET':
+            if (isset($_GET['id'])) {
+                $id = intval($_GET['id']);
+                $stmt = $pdo->prepare("SELECT id, username, full_name, role, email, created_at FROM users WHERE id = ?");
+                $stmt->execute([$id]);
+                $data = $stmt->fetch(PDO::FETCH_ASSOC);
+                
+                if ($data) {
+                    echo json_encode(["status" => "success", "data" => $data]);
+                } else {
+                    echo json_encode(["status" => "error", "message" => "User tidak ditemukan"]);
+                }
+            } else {
+                if (isset($_GET['role'])) {
+                    $role = $_GET['role'];
+                    $stmt = $pdo->prepare("SELECT id, username, full_name, role, email, created_at FROM users WHERE role = ? ORDER BY username ASC");
+                    $stmt->execute([$role]);
+                } else {
+                    $stmt = $pdo->query("SELECT id, username, full_name, role, email, created_at FROM users ORDER BY username ASC");
+                }
+                $data = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                echo json_encode(["status" => "success", "data" => $data]);
+            }
+            break;
+            
+        case 'POST':
+            $input = json_decode(file_get_contents("php://input"), true);
+            if (!isset($input['username'], $input['password'], $input['role'])) {
+                echo json_encode(["status" => "error", "message" => "Data tidak lengkap (username, password, role diperlukan)"]);
+                exit;
+            }
+            
+            // Check if username already exists
+            $stmt = $pdo->prepare("SELECT id FROM users WHERE username = ?");
+            $stmt->execute([$input['username']]);
+            if ($stmt->fetch()) {
+                echo json_encode(["status" => "error", "message" => "Username sudah digunakan"]);
+                exit;
+            }
+            
+            $stmt = $pdo->prepare("INSERT INTO users (username, password, full_name, role, email) VALUES (?, ?, ?, ?, ?)");
+            $result = $stmt->execute([
+                $input['username'],
+                password_hash($input['password'], PASSWORD_DEFAULT),
+                $input['full_name'] ?? null,
+                $input['role'],
+                $input['email'] ?? null
+            ]);
+            
+            echo json_encode([
+                "status" => $result ? "success" : "error",
+                "message" => $result ? "User berhasil ditambahkan" : "Gagal menambahkan user",
+                "id" => $result ? $pdo->lastInsertId() : null
+            ]);
+            break;
+            
+        case 'PUT':
+            $input = json_decode(file_get_contents("php://input"), true);
+            if (!isset($input['id'])) {
+                echo json_encode(["status" => "error", "message" => "ID tidak ditemukan"]);
+                exit;
+            }
+            
+            $updateFields = [];
+            $params = [];
+            
+            if (isset($input['username'])) {
+                // Check if username already exists for other users
+                $stmt = $pdo->prepare("SELECT id FROM users WHERE username = ? AND id != ?");
+                $stmt->execute([$input['username'], $input['id']]);
+                if ($stmt->fetch()) {
+                    echo json_encode(["status" => "error", "message" => "Username sudah digunakan"]);
+                    exit;
+                }
+                $updateFields[] = "username = ?";
+                $params[] = $input['username'];
+            }
+            
+            if (isset($input['password']) && !empty($input['password'])) {
+                $updateFields[] = "password = ?";
+                $params[] = password_hash($input['password'], PASSWORD_DEFAULT);
+            }
+            
+            if (isset($input['full_name'])) {
+                $updateFields[] = "full_name = ?";
+                $params[] = $input['full_name'];
+            }
+            
+            if (isset($input['role'])) {
+                $updateFields[] = "role = ?";
+                $params[] = $input['role'];
+            }
+            
+            if (isset($input['email'])) {
+                $updateFields[] = "email = ?";
+                $params[] = $input['email'];
+            }
+            
+            $params[] = $input['id'];
+            
+            $stmt = $pdo->prepare("UPDATE users SET " . implode(", ", $updateFields) . " WHERE id = ?");
+            $result = $stmt->execute($params);
+            
+            echo json_encode([
+                "status" => $result ? "success" : "error",
+                "message" => $result ? "User berhasil diupdate" : "Gagal mengupdate user"
+            ]);
+            break;
+            
+        case 'DELETE':
+            $input = json_decode(file_get_contents("php://input"), true);
+            if (!isset($input['id'])) {
+                echo json_encode(["status" => "error", "message" => "ID tidak ditemukan"]);
+                exit;
+            }
+            
+            $stmt = $pdo->prepare("DELETE FROM users WHERE id = ?");
+            $result = $stmt->execute([$input['id']]);
+            
+            echo json_encode([
+                "status" => $result ? "success" : "error",
+                "message" => $result ? "User berhasil dihapus" : "Gagal menghapus user"
+            ]);
+            break;
+    }
+}
+
+// ==================== DASHBOARD FUNCTIONS ====================
+function handleDashboard($pdo, $method) {
+    if ($method !== 'GET') {
+        echo json_encode(["status" => "error", "message" => "Method tidak didukung"]);
+        return;
     }
     
-} catch (Exception $e) {
-    error_log("API Error: " . $e->getMessage());
-    ApiResponse::error("Internal server error", 500);
+    try {
+        // Total pendapatan hari ini
+        $stmt = $pdo->query("
+            SELECT COALESCE(SUM(total_amount), 0) as today_revenue
+            FROM orders
+            WHERE DATE(order_date) = CURDATE() AND status = 'completed'
+        ");
+        $todayRevenue = $stmt->fetch(PDO::FETCH_ASSOC)['today_revenue'];
+        
+        // Total pendapatan bulan ini
+        $stmt = $pdo->query("
+            SELECT COALESCE(SUM(total_amount), 0) as month_revenue
+            FROM orders
+            WHERE MONTH(order_date) = MONTH(CURDATE()) 
+            AND YEAR(order_date) = YEAR(CURDATE())
+            AND status = 'completed'
+        ");
+        $monthRevenue = $stmt->fetch(PDO::FETCH_ASSOC)['month_revenue'];
+        
+        // Total pesanan hari ini
+        $stmt = $pdo->query("
+            SELECT COUNT(*) as today_orders
+            FROM orders
+            WHERE DATE(order_date) = CURDATE()
+        ");
+        $todayOrders = $stmt->fetch(PDO::FETCH_ASSOC)['today_orders'];
+        
+        // Pesanan aktif
+        $stmt = $pdo->query("
+            SELECT COUNT(*) as active_orders
+            FROM orders
+            WHERE status = 'pending'
+        ");
+        $activeOrders = $stmt->fetch(PDO::FETCH_ASSOC)['active_orders'];
+        
+        // Meja tersedia
+        $stmt = $pdo->query("
+            SELECT COUNT(*) as available_tables
+            FROM tables
+            WHERE status = 'available'
+        ");
+        $availableTables = $stmt->fetch(PDO::FETCH_ASSOC)['available_tables'];
+        
+        // Menu terpopuler (bulan ini)
+        $stmt = $pdo->query("
+            SELECT m.name, m.category, SUM(od.quantity) as total_sold
+            FROM order_details od
+            JOIN menu m ON od.menu_id = m.id
+            JOIN orders o ON od.order_id = o.id
+            WHERE MONTH(o.order_date) = MONTH(CURDATE())
+            AND YEAR(o.order_date) = YEAR(CURDATE())
+            GROUP BY m.id, m.name, m.category
+            ORDER BY total_sold DESC
+            LIMIT 5
+        ");
+        $popularMenu = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        
+        // Pendapatan 7 hari terakhir
+        $stmt = $pdo->query("
+            SELECT DATE(order_date) as date, COALESCE(SUM(total_amount), 0) as revenue
+            FROM orders
+            WHERE order_date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
+            AND status = 'completed'
+            GROUP BY DATE(order_date)
+            ORDER BY date ASC
+        ");
+        $weeklyRevenue = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        
+        echo json_encode([
+            "status" => "success",
+            "data" => [
+                "today_revenue" => $todayRevenue,
+                "month_revenue" => $monthRevenue,
+                "today_orders" => $todayOrders,
+                "active_orders" => $activeOrders,
+                "available_tables" => $availableTables,
+                "popular_menu" => $popularMenu,
+                "weekly_revenue" => $weeklyRevenue
+            ]
+        ]);
+    } catch (Exception $e) {
+        echo json_encode([
+            "status" => "error",
+            "message" => "Gagal mengambil data dashboard: " . $e->getMessage()
+        ]);
+    }
 }
+?>
